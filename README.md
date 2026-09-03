@@ -15,3 +15,6 @@
 - command: ollama pull <models>
 - decoding model: qwen2.5:3b
 - embedding model: nomic-embed-text
+
+## vector store
+- chroma
