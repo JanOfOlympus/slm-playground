@@ -2,7 +2,7 @@ import streamlit as st
 import requests
 
 st.title("SLM Playground")
-task = st.selectbox("Task", ["Rephrase formally", "Extract as JSON"])
+task = st.selectbox("Task", ["Rephrase formally", "Extract as JSON", "Sql"])
 text = st.text_area("Input text")
 
 if st.button("Run"):
