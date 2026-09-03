@@ -6,7 +6,7 @@
 - deactivate
 
 ## pip
-- py -m pip install streamlit requests numpy
+- py -m pip install streamlit requests numpy chromadb
 
 ## streamlit
 - streamlit run app.py
