@@ -1,0 +1,244 @@
+"""
+Slip field extractor — pre-extracted text.
+
+Reads clean OCR text (e.g. from Apple Live Text) saved as .txt files in
+./transactions, and parses each into structured JSON: who paid, who received,
+amount, fee, date, transaction ref.
+
+A local text LLM (qwen2.5:3b via Ollama) does the structural parse — the OCR
+lines are often out of reading order (labels grouped together, values following
+as a separate block), which a model handles from context far better than line
+pairing. A deterministic regex pass then overrides amount / fee / date / type.
+
+Nothing leaves the machine.
+
+    streamlit run app_text.py
+
+Needs: `ollama serve` running + `ollama pull qwen2.5:3b`
+"""
+
+import json
+import re
+from pathlib import Path
+
+import requests
+import streamlit as st
+
+# --- Config ---
+OLLAMA_URL = "http://localhost:11434"
+PARSE_MODEL = "qwen2.5:3b"
+
+TXT_DIR = Path(__file__).parent / "transactions"
+JSON_DIR = Path(__file__).parent / "transactions_json"
+
+
+PROMPT = """You are given OCR text from a Thai bank e-slip (a transfer, a bill \
+payment, or a QR/PromptPay payment). The lines are often NOT in reading order: \
+labels that end with ":" are frequently grouped together, with their values \
+following as a separate block in the same order.
+
+Rules:
+- The PAYER (from) is the person/account named near the TOP of the slip.
+- The PAYEE (to) is the shop, biller, government agency, or person named AFTER
+  the payer's masked account number.
+- Label -> field mapping (Thai):
+  - "เลขที่รายการ" / "หมายเลขอ้างอิง" / "รหัสอ้างอิง" -> transaction_ref
+  - "จำนวน" / "จำนวนเงิน" / "จานวนเงิน" -> amount
+  - "ค่าธรรมเนียม" -> fee
+  - "วันที่ทำรายการ" -> datetime
+- amount and fee are the values written with "บาท"; fee is usually "0.00".
+- Keep Thai text in Thai. Do not guess a value that is not present.
+
+Reply with ONLY this JSON object and nothing else:
+{
+  "slip_type": "transfer" | "bill_payment" | "qr_payment" | "unknown",
+  "datetime": string or null,
+  "from": {"name": string or null, "bank": string or null, "account": string or null},
+  "to":   {"name": string or null, "bank": string or null, "account": string or null},
+  "amount": string or null,
+  "fee": string or null,
+  "transaction_ref": string or null
+}
+
+OCR text:
+<<<
+{text}
+>>>"""
+
+
+def list_txt(folder: Path) -> list[Path]:
+    if not folder.is_dir():
+        return []
+    return sorted(p for p in folder.iterdir() if p.is_file() and p.suffix.lower() == ".txt")
+
+
+_BAHT_RE = re.compile(r"([\d,]+\.\d{2})\s*บาท")
+_DATETIME_RE = re.compile(
+    r"\d{1,2}\s+[ก-๙.]{2,6}\s+\d{2,4}\s*[-–]?\s*\d{1,2}[:.]\d{2}(?:\s*น\.?)?"
+)
+_TITLE_RE = re.compile(r"^(?:น\.ส\.?|นาย|นาง|ด\.ช\.|ด\.ญ\.)\s*\S")
+_ACCT_RE = re.compile(r"[xX]{2,4}-[xX0-9]-[xX0-9]{2,}-[xX0-9]")
+_LATIN_SUFFIX_RE = re.compile(r"\(?[A-Za-z.\-/ ]+\)?")
+
+
+def _layout_names(text: str) -> tuple[str | None, str | None]:
+    """
+    On these slips the two parties are positional, not labelled:
+    - payer  = the first line with a Thai personal title (น.ส./นาย/นาง/...)
+    - payee  = the first Thai line after the payer's masked account number
+               (skipping "K+" and label/number noise)
+    """
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+    from_name = next((ln for ln in lines if _TITLE_RE.match(ln)), None)
+
+    to_name = None
+    acct_idx = next((i for i, ln in enumerate(lines) if _ACCT_RE.search(ln)), None)
+    if acct_idx is not None:
+        rest = lines[acct_idx + 1:]
+        for j, ln in enumerate(rest):
+            if ln == "K+" or ln.endswith(":") or ln[0].isdigit():
+                continue
+            if not re.search(r"[ก-๙]", ln):
+                continue
+            to_name = ln
+            nxt = rest[j + 1] if j + 1 < len(rest) else ""
+            if nxt and _LATIN_SUFFIX_RE.fullmatch(nxt):
+                to_name = f"{ln} {nxt}"
+            break
+
+    return from_name, to_name
+
+
+def quick_fields(text: str) -> dict:
+    """Deterministic extraction of the fields that don't need a model."""
+    out: dict = {}
+
+    if "ชำระเงินสำเร็จ" in text:
+        out["slip_type"] = "qr_payment"
+    elif "จ่ายบิลสำเร็จ" in text:
+        out["slip_type"] = "bill_payment"
+    elif "โอนเงินสำเร็จ" in text:
+        out["slip_type"] = "transfer"
+
+    baht = [m.replace(",", "") for m in _BAHT_RE.findall(text)]
+    if len(baht) >= 2:
+        out["amount"], out["fee"] = baht[0], baht[1]
+    elif len(baht) == 1:
+        out["amount"] = baht[0]
+
+    dt = _DATETIME_RE.search(text)
+    if dt:
+        out["datetime"] = dt.group(0).strip()
+
+    from_name, to_name = _layout_names(text)
+    if from_name:
+        out["_from_name"] = from_name
+    if to_name:
+        out["_to_name"] = to_name
+
+    return out
+
+
+def parse_llm(text: str, model: str) -> dict:
+    """Ask the local text model to structure the slip. {'_error': ...} on model trouble."""
+    try:
+        resp = requests.post(
+            f"{OLLAMA_URL}/api/generate",
+            json={
+                "model": model,
+                "prompt": PROMPT.replace("{text}", text),
+                "stream": False,
+                "format": "json",
+            },
+            timeout=120,
+        )
+    except requests.ConnectionError:
+        raise RuntimeError(
+            f"Ollama not reachable at {OLLAMA_URL}. Start it with `ollama serve`."
+        )
+    except requests.Timeout:
+        return {"_error": "Model timed out (120s)."}
+
+    if resp.status_code == 404:
+        return {"_error": f"Model '{model}' not found. Run: ollama pull {model}"}
+    if not resp.ok:
+        return {"_error": f"Ollama error {resp.status_code}: {resp.text[:200]}"}
+
+    raw = resp.json().get("response", "")
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return {"_error": f"Model did not return JSON: {raw[:200]}"}
+
+
+def extract_fields(text: str, model: str) -> dict:
+    """LLM parse, with the deterministic fields (type, amount, fee, date, the two
+    party names) overridden by the regex/layout pass."""
+    result = parse_llm(text, model)
+    if "_error" in result:
+        return result
+
+    qf = quick_fields(text)
+    from_name = qf.pop("_from_name", None)
+    to_name = qf.pop("_to_name", None)
+    for key, value in qf.items():
+        result[key] = value
+
+    for side, name in (("from", from_name), ("to", to_name)):
+        if name:
+            if not isinstance(result.get(side), dict):
+                result[side] = {"name": None, "bank": None, "account": None}
+            result[side]["name"] = name
+
+    return result
+
+
+# --- UI ---
+st.title("Slip Field Extractor — pre-extracted text")
+st.caption(
+    f"Reads `.txt` files from `{TXT_DIR}` (clean OCR, e.g. Apple Live Text). "
+    "Needs Ollama running and `ollama pull qwen2.5:3b`. Everything runs locally."
+)
+
+model = st.text_input("Ollama text model", value=PARSE_MODEL)
+
+files = list_txt(TXT_DIR)
+if not files:
+    st.warning(f"No .txt files in `{TXT_DIR}`. Add some slip texts and rerun.")
+    st.stop()
+
+st.caption(f"Parsed JSON is also written to `{JSON_DIR}`.")
+
+if st.button("Parse all transactions"):
+    JSON_DIR.mkdir(exist_ok=True)
+    for path in files:
+        st.subheader(path.name)
+        text = path.read_text(encoding="utf-8")
+        col_txt, col_out = st.columns(2)
+        with col_txt:
+            st.code(text, language=None)
+        with col_out:
+            with st.spinner(f"Parsing {path.name} with {model}…"):
+                try:
+                    result = extract_fields(text, model)
+                except RuntimeError as e:
+                    st.error(str(e))
+                    st.stop()
+
+            if "_error" in result:
+                st.error(result["_error"])
+                continue
+
+            payload = json.dumps(result, ensure_ascii=False, indent=2)
+            out_path = JSON_DIR / f"{path.stem}.json"
+            out_path.write_text(payload, encoding="utf-8")
+
+            st.json(result)
+            st.caption(f"Saved to `{out_path}`")
+            st.download_button(
+                "Download .json",
+                data=payload,
+                file_name=f"{path.stem}.json",
+                key=f"js_{path.name}",
+            )

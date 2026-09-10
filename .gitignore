@@ -1,0 +1,4 @@
+images/*
+transactions/*
+transactions_json/*
+__pycache__/

@@ -1,125 +1,120 @@
+import os
+from pathlib import Path
+
+import pytesseract
 import streamlit as st
-import requests
-import numpy as np
+from PIL import Image, ImageOps
 
-st.title("SLM Agent Playground")
+# --- Config ---
+IMAGE_DIR = Path(__file__).parent / "images"
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp", ".gif"}
 
-# --- Sample corpus (dummy docs for the demo) ---
-DOCS = [
-    "The company's return policy allows refunds within 30 days of purchase with a valid receipt.",
-    "Employees are entitled to 15 days of paid annual leave per year, accrued monthly.",
-    "The office WiFi password is changed every quarter; check with IT for the current one.",
-    "Standard shipping takes 3-5 business days; express shipping takes 1-2 business days.",
-    "The Q3 budget review meeting is scheduled for the last Friday of each quarter.",
+# Project-local language data (holds tha/eng traineddata so no admin install is
+# needed). Picked up via TESSDATA_PREFIX below when the folder exists.
+TESSDATA_DIR = Path(__file__).parent / "tessdata"
+
+# Locate the Tesseract binary: $TESSERACT_CMD wins, otherwise fall back to PATH
+# and the standard Windows install locations so no env var is needed.
+_TESS_CANDIDATES = [
+    os.environ.get("TESSERACT_CMD"),
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+    r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+    os.path.expandvars(r"%LOCALAPPDATA%\Programs\Tesseract-OCR\tesseract.exe"),
 ]
+for _cand in _TESS_CANDIDATES:
+    if _cand and os.path.isfile(_cand):
+        pytesseract.pytesseract.tesseract_cmd = _cand
+        break
 
-OLLAMA_URL = "http://localhost:11434"
-GEN_MODEL = "qwen2.5:3b"
-EMBED_MODEL = "nomic-embed-text"
-
-
-def call_model(prompt, model=GEN_MODEL):
-    resp = requests.post(f"{OLLAMA_URL}/api/generate", json={
-        "model": model,
-        "prompt": prompt,
-        "stream": False
-    })
-    resp.raise_for_status()
-    return resp.json()["response"].strip()
+# Use the project-local language data if it's there. Done via TESSDATA_PREFIX
+# rather than --tessdata-dir: pytesseract can't pass a quoted path on Windows,
+# so a --tessdata-dir with spaces in it would break.
+if TESSDATA_DIR.is_dir():
+    os.environ["TESSDATA_PREFIX"] = str(TESSDATA_DIR)
 
 
-def embed(text):
-    resp = requests.post(f"{OLLAMA_URL}/api/embeddings", json={
-        "model": EMBED_MODEL,
-        "prompt": text
-    })
-    resp.raise_for_status()
-    return np.array(resp.json()["embedding"])
+st.title("Image OCR Playground")
 
 
-def cosine_sim(a, b):
-    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+def list_images(folder: Path) -> list[Path]:
+    if not folder.is_dir():
+        return []
+    return sorted(
+        p for p in folder.iterdir()
+        if p.is_file() and p.suffix.lower() in IMAGE_EXTS
+    )
 
 
-@st.cache_resource
-def build_index():
-    return [embed(doc) for doc in DOCS]
+def ocr_image(path: Path, lang: str) -> str:
+    img = Image.open(path)
+    # Respect EXIF orientation and drop alpha so Tesseract gets a clean grayscale.
+    img = ImageOps.exif_transpose(img)
+    img = ImageOps.grayscale(img)
+    # Thai text has no inter-word spaces; keep the ones Tesseract does find.
+    config = "--oem 1 --psm 6 -c preserve_interword_spaces=1"
+    return pytesseract.image_to_string(img, lang=lang, config=config).strip()
 
 
-def retrieve(query, top_k=2):
-    query_vec = embed(query)
-    doc_vecs = build_index()
-    sims = [cosine_sim(query_vec, v) for v in doc_vecs]
-    top_indices = np.argsort(sims)[::-1][:top_k]
-    return [(DOCS[i], sims[i]) for i in top_indices]
+IMAGE_DIR.mkdir(exist_ok=True)
+images = list_images(IMAGE_DIR)
 
+st.write(f"Reading images from `{IMAGE_DIR}`")
 
-def classify_task(text):
-    prompt = f"""Classify the input into exactly ONE category. Respond with ONLY the category word, nothing else.
+if not images:
+    st.warning(
+        f"No images found in `{IMAGE_DIR}`. "
+        f"Drop some files in there ({', '.join(sorted(IMAGE_EXTS))}) and rerun."
+    )
+    st.stop()
 
-Categories:
-- rephrase: informal/casual text that could be made more formal, with no question being asked
-- extract: text containing structured data like amounts, dates, names, invoices, receipts
-- rag_qa: a question likely about company policy, leave, shipping, WiFi, or budget meetings
-- none: doesn't fit any of the above (jokes, small talk, unrelated topics, general knowledge questions)
+try:
+    installed = pytesseract.get_languages(config="")
+except pytesseract.TesseractNotFoundError:
+    st.error(
+        "Tesseract binary not found. Install it and either add it to PATH or set "
+        "the TESSERACT_CMD environment variable to its full path."
+    )
+    st.stop()
 
-Input: {text}
+default_langs = [l for l in ("tha", "eng") if l in installed] or installed[:1]
+selected = st.multiselect(
+    "Tesseract language(s)",
+    options=sorted(installed),
+    default=default_langs,
+    help="Pick 'tha' for Thai. Combine with 'eng' for mixed Thai/English documents.",
+)
+lang = "+".join(selected) if selected else "eng"
 
-Category:"""
-    result = call_model(prompt).lower().strip()
-    for valid in ["rephrase", "extract", "rag_qa", "none"]:
-        if valid in result:
-            return valid
-    return "none"  # safer fallback when classification is unclear
+if "tha" not in installed:
+    st.warning(
+        f"Thai language data ('tha') not found. Put `tha.traineddata` in `{TESSDATA_DIR}` "
+        "(alongside `eng.traineddata`). Download: "
+        "https://github.com/tesseract-ocr/tessdata/raw/main/tha.traineddata"
+    )
 
-
-def strip_json_fences(raw):
-    raw = raw.strip()
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.lower().startswith("json"):
-            raw = raw[4:]
-    end = raw.rfind("}")
-    if end != -1:
-        raw = raw[:end + 1]
-    return raw.strip()
-
-
-st.write("Paste any input — the agent decides what to do with it.")
-text = st.text_area("Input text")
-
-if st.button("Run") and text.strip():
-    with st.spinner("Classifying..."):
-        task = classify_task(text)
-    st.info(f"🤖 Agent decided: **{task}**")
-
-    if task == "none":
-        st.warning("This doesn't match a supported task (rephrase, extract, or company Q&A). No action taken.")
-    else:
-        if task == "rag_qa":
-            results = retrieve(text)
-            context = "\n".join([f"- {doc}" for doc, score in results])
-            with st.expander("Retrieved context (debug)"):
-                for doc, score in results:
-                    st.write(f"**{score:.3f}** — {doc}")
-            prompt = f"""Answer using ONLY the context below. If not covered, say so.
-
-Context:
-{context}
-
-Question: {text}
-
-Answer:"""
-        elif task == "extract":
-            prompt = f"""Today's date is 2026-09-03. Extract as JSON. Return ONLY the JSON object, no markdown, no explanation.
-
-Text: {text}"""
-        else:  # rephrase
-            prompt = f"Rephrase more formally: {text}"
-
-        with st.spinner("Generating..."):
-            result = call_model(prompt)
-            if task == "extract":
-                result = strip_json_fences(result)
-
-        st.code(result, height=200)
+if st.button("Run OCR on all images"):
+    for path in images:
+        st.subheader(path.name)
+        col_img, col_txt = st.columns(2)
+        with col_img:
+            st.image(str(path), use_container_width=True)
+        with col_txt:
+            with st.spinner(f"OCR: {path.name}"):
+                try:
+                    text = ocr_image(path, lang)
+                except pytesseract.TesseractNotFoundError:
+                    st.error(
+                        "Tesseract binary not found. Install it and either add it to "
+                        "PATH or set the TESSERACT_CMD environment variable to its full path."
+                    )
+                    st.stop()
+            if text:
+                st.code(text, height=300)
+                st.download_button(
+                    "Download .txt",
+                    data=text,
+                    file_name=f"{path.stem}.txt",
+                    key=f"dl_{path.name}",
+                )
+            else:
+                st.info("No text detected.")
