@@ -48,6 +48,12 @@ Rules:
   - "วันที่ทำรายการ" -> datetime
 - amount and fee are the values written with "บาท"; fee is usually "0.00".
 - Keep Thai text in Thai. Do not guess a value that is not present.
+- "category": category of the PAYEE ("to"). ONLY assign a specific value when the
+  payee is unmistakable from its name (a nationally known chain, bank, utility, or
+  government agency). For a small/local shop, an unfamiliar name, a holding
+  company, or any doubt -> use "other". It is better to answer "other" than to
+  guess. Values: food, groceries, shopping, transport, utilities, health,
+  entertainment, services, education, government, transfer, other.
 
 Reply with ONLY this JSON object and nothing else:
 {
@@ -55,6 +61,7 @@ Reply with ONLY this JSON object and nothing else:
   "datetime": string or null,
   "from": {"name": string or null, "bank": string or null, "account": string or null},
   "to":   {"name": string or null, "bank": string or null, "account": string or null},
+  "category": "food" | "groceries" | "shopping" | "transport" | "utilities" | "health" | "entertainment" | "services" | "education" | "government" | "transfer" | "other",
   "amount": string or null,
   "fee": string or null,
   "transaction_ref": string or null
@@ -79,6 +86,29 @@ _DATETIME_RE = re.compile(
 _TITLE_RE = re.compile(r"^(?:น\.ส\.?|นาย|นาง|ด\.ช\.|ด\.ญ\.)\s*\S")
 _ACCT_RE = re.compile(r"[xX]{2,4}-[xX0-9]-[xX0-9]{2,}-[xX0-9]")
 _LATIN_SUFFIX_RE = re.compile(r"\(?[A-Za-z.\-/ ]+\)?")
+
+CATEGORIES = (
+    "food", "groceries", "shopping", "transport", "utilities", "health",
+    "entertainment", "services", "education", "government", "transfer", "other",
+)
+
+# Only the offline-certain billers stay hardcoded — no point paying an API to
+# recognise the electricity authority every month. Everything else goes:
+# local SLM first, then (optionally) a third-party AI for whatever it can't place.
+_CATEGORY_RULES: list[tuple[str, tuple[str, ...]]] = [
+    ("utilities", ("การไฟฟ้า", "การประปา", "ประปา", "กปน", "กปภ", "กฟน", "กฟภ",
+                   "ค่าไฟ", "ค่าน้ำ", "ค่าโทรศัพท์")),
+    ("government", ("กรมสรรพากร", "สรรพากร", "กรมการปกครอง", "เทศบาล",
+                    "กรมที่ดิน", "ขนส่งทางบก")),
+]
+
+
+def _category_from_rules(payee: str | None, text: str) -> str | None:
+    hay = f"{payee or ''}\n{text}".lower()
+    for category, needles in _CATEGORY_RULES:
+        if any(n.lower() in hay for n in needles):
+            return category
+    return None
 
 
 def _layout_names(text: str) -> tuple[str | None, str | None]:
@@ -137,6 +167,12 @@ def quick_fields(text: str) -> dict:
     if to_name:
         out["_to_name"] = to_name
 
+    if out.get("slip_type") == "transfer" and from_name and to_name:
+        out["_category"] = "transfer"  # person-to-person, no merchant
+    rule_cat = _category_from_rules(to_name, text)
+    if rule_cat:
+        out["_category"] = rule_cat
+
     return out
 
 
@@ -174,7 +210,9 @@ def parse_llm(text: str, model: str) -> dict:
 
 def extract_fields(text: str, model: str) -> dict:
     """LLM parse, with the deterministic fields (type, amount, fee, date, the two
-    party names) overridden by the regex/layout pass."""
+    party names) overridden by the regex/layout pass. `category` is the local
+    model's guess corrected by the rule table; anything it can't place stays
+    "other" for step 2 (resolve_categories.py) to handle."""
     result = parse_llm(text, model)
     if "_error" in result:
         return result
@@ -182,8 +220,12 @@ def extract_fields(text: str, model: str) -> dict:
     qf = quick_fields(text)
     from_name = qf.pop("_from_name", None)
     to_name = qf.pop("_to_name", None)
+    rule_category = qf.pop("_category", None)
     for key, value in qf.items():
         result[key] = value
+    if rule_category:
+        result["category"] = rule_category
+    result.setdefault("category", "other")
 
     for side, name in (("from", from_name), ("to", to_name)):
         if name:

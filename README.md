@@ -24,16 +24,32 @@
 
 ## streamlit
 - `streamlit run app.py` — OCR: image (`images/`) -> raw text (Tesseract)
-- `streamlit run app_text.py` — structured slip fields from clean text (`transactions/`) **[recommended]**
+- `streamlit run app_text.py` — step 1 of the slip pipeline (clean text -> JSON) **[recommended]**
 - `streamlit run app_vision.py` — structured slip fields straight from images (`images/`)
+- `python resolve_categories.py` — step 2 (fill in `other` categories via a third-party AI)
 
-## app_text.py (clean text -> JSON) — recommended
+## slip pipeline (two steps)
+
+### step 1 — app_text.py (clean text -> JSON, fully local)
 - put clean OCR text (e.g. Apple Live Text "Copy All Text") as `transactions/slip_*.txt`
 - `qwen2.5:3b` structures each slip; a deterministic pass then pins slip_type,
   amount, fee, datetime, and the two party names (payer = first Thai-title line,
   payee = first Thai line after the masked account no.)
-- needs: `ollama serve` + `ollama pull qwen2.5:3b`
-- ~12-15 s per slip on CPU; nothing leaves the machine
+- `category` = food / groceries / shopping / transport / utilities / health /
+  entertainment / services / education / government / transfer / other.
+  Only rule-certain billers (electricity/water/gov) and P2P transfers are set
+  here; everything else is left as `other` for step 2. The local model is told
+  to answer `other` rather than guess.
+- writes `transactions_json/<slip>.json`
+- needs: `ollama serve` + `ollama pull qwen2.5:3b`; ~12-15 s per slip; nothing leaves the machine
+
+### step 2 — resolve_categories.py (category lookup via Anthropic API)
+- reads `transactions_json/*.json`; for each still `other`, sends **only** the
+  payee name to Claude and writes back `category` + `category_source: api:anthropic`
+- no amount / account / payer / date is ever sent
+- `python resolve_categories.py` (add `--force` to redo all, `--dry-run` to preview)
+- configure: `$env:ANTHROPIC_API_KEY = "sk-ant-..."`
+  (optional `$env:CATEGORY_MODEL`, default `claude-haiku-4-5-20251001`)
 
 ## app_vision.py (image -> JSON) — fallback for messy OCR
 - a local Ollama **vision** model reads each slip image directly
