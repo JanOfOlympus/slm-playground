@@ -6,15 +6,15 @@
 - deactivate
 
 ## pip
-- py -m pip install streamlit requests numpy chromadb pytesseract pillow
+- py -m pip install streamlit requests numpy pandas chromadb pytesseract pillow
 
-## tesseract (OCR engine)
+## tesseract (OCR engine — used by app_vision.py)
 - install the binary: `winget install UB-Mannheim.TesseractOCR` (or the UB-Mannheim installer)
-- app.py auto-detects the binary at `C:\Program Files\Tesseract-OCR\tesseract.exe`;
+- app_vision.py auto-detects the binary at `C:\Program Files\Tesseract-OCR\tesseract.exe`;
   override with `$env:TESSERACT_CMD` if yours is elsewhere
 
 ## language data (project-local, no admin needed)
-- app.py loads traineddata from `./tessdata/` (via `TESSDATA_PREFIX`) when that folder exists
+- app_vision.py loads traineddata from `./tessdata/` (via `TESSDATA_PREFIX`) when that folder exists
 - create it once:
   - `mkdir tessdata`
   - `curl -L -o tessdata/tha.traineddata https://github.com/tesseract-ocr/tessdata/raw/main/tha.traineddata`
@@ -23,10 +23,19 @@
 - `tessdata/` is gitignored; recreate it with the steps above after a fresh clone
 
 ## streamlit
-- `streamlit run app.py` — OCR: image (`images/`) -> raw text (Tesseract)
-- `streamlit run app_text.py` — step 1 of the slip pipeline (clean text -> JSON) **[recommended]**
+- `streamlit run app.py` — **dashboard**: spend by date range, time, amount, category (`transactions_json/`)
+- `streamlit run app_text.py` — step 1 of the slip pipeline (clean text -> JSON)
 - `streamlit run app_vision.py` — structured slip fields straight from images (`images/`)
 - `python resolve_categories.py` — step 2 (fill in `other` categories via a third-party AI)
+
+## app.py (dashboard)
+- reads every `transactions_json/*.json` (skips any with no parseable date/amount)
+- sidebar filters: date range, category (multiselect), amount range
+- KPIs: total spend, transaction count, average, total fees (all filtered)
+- drill-downs: spend by day / hour / weekday (tabs), spend by category
+  (chart + table), top payees (chart), full sortable transaction table
+- purely local, no network calls; `.claude/launch.json` has a `dashboard` config
+  for previewing it in-editor
 
 ## slip pipeline (two steps)
 

@@ -1,120 +1,155 @@
-import os
+"""
+Spending Dashboard
+
+Reads every JSON file in ./transactions_json (written by app_text.py /
+app_vision.py, categories filled in by resolve_categories.py) and lets you
+drill into spend by date range, time, amount, and category/payee.
+
+Nothing leaves the machine — this only reads local files.
+
+    streamlit run app.py
+"""
+
+import json
 from pathlib import Path
 
-import pytesseract
+import pandas as pd
 import streamlit as st
-from PIL import Image, ImageOps
 
-# --- Config ---
-IMAGE_DIR = Path(__file__).parent / "images"
-IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp", ".gif"}
+JSON_DIR = Path(__file__).parent / "transactions_json"
+WEEKDAY_ORDER = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
-# Project-local language data (holds tha/eng traineddata so no admin install is
-# needed). Picked up via TESSDATA_PREFIX below when the folder exists.
-TESSDATA_DIR = Path(__file__).parent / "tessdata"
-
-# Locate the Tesseract binary: $TESSERACT_CMD wins, otherwise fall back to PATH
-# and the standard Windows install locations so no env var is needed.
-_TESS_CANDIDATES = [
-    os.environ.get("TESSERACT_CMD"),
-    r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-    r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-    os.path.expandvars(r"%LOCALAPPDATA%\Programs\Tesseract-OCR\tesseract.exe"),
-]
-for _cand in _TESS_CANDIDATES:
-    if _cand and os.path.isfile(_cand):
-        pytesseract.pytesseract.tesseract_cmd = _cand
-        break
-
-# Use the project-local language data if it's there. Done via TESSDATA_PREFIX
-# rather than --tessdata-dir: pytesseract can't pass a quoted path on Windows,
-# so a --tessdata-dir with spaces in it would break.
-if TESSDATA_DIR.is_dir():
-    os.environ["TESSDATA_PREFIX"] = str(TESSDATA_DIR)
+st.set_page_config(page_title="Spending Dashboard", layout="wide")
 
 
-st.title("Image OCR Playground")
+def load_transactions(folder: Path) -> pd.DataFrame:
+    """One row per slip JSON. datetime/amount that don't parse become NaT/NaN."""
+    rows = []
+    for path in sorted(folder.glob("*.json")):
+        try:
+            d = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+
+        dt = pd.to_datetime(d.get("datetime"), format="%Y-%m-%d %H:%M", errors="coerce")
+        rows.append({
+            "file": path.name,
+            "datetime": dt,
+            "date": dt.date() if pd.notna(dt) else None,
+            "hour": dt.hour if pd.notna(dt) else None,
+            "weekday": dt.strftime("%a") if pd.notna(dt) else None,
+            "amount": pd.to_numeric(d.get("amount"), errors="coerce"),
+            "fee": pd.to_numeric(d.get("fee"), errors="coerce"),
+            "category": d.get("category") or "other",
+            "slip_type": d.get("slip_type") or "unknown",
+            "payee": (d.get("to") or {}).get("name") or "(unknown)",
+            "payer": (d.get("from") or {}).get("name") or "(unknown)",
+            "transaction_ref": d.get("transaction_ref"),
+        })
+    return pd.DataFrame(rows)
 
 
-def list_images(folder: Path) -> list[Path]:
-    if not folder.is_dir():
-        return []
-    return sorted(
-        p for p in folder.iterdir()
-        if p.is_file() and p.suffix.lower() in IMAGE_EXTS
-    )
+st.title("💸 Spending Dashboard")
+st.caption(f"Reads every slip JSON from `{JSON_DIR}`.")
 
+df = load_transactions(JSON_DIR)
 
-def ocr_image(path: Path, lang: str) -> str:
-    img = Image.open(path)
-    # Respect EXIF orientation and drop alpha so Tesseract gets a clean grayscale.
-    img = ImageOps.exif_transpose(img)
-    img = ImageOps.grayscale(img)
-    # Thai text has no inter-word spaces; keep the ones Tesseract does find.
-    config = "--oem 1 --psm 6 -c preserve_interword_spaces=1"
-    return pytesseract.image_to_string(img, lang=lang, config=config).strip()
-
-
-IMAGE_DIR.mkdir(exist_ok=True)
-images = list_images(IMAGE_DIR)
-
-st.write(f"Reading images from `{IMAGE_DIR}`")
-
-if not images:
-    st.warning(
-        f"No images found in `{IMAGE_DIR}`. "
-        f"Drop some files in there ({', '.join(sorted(IMAGE_EXTS))}) and rerun."
-    )
+if df.empty:
+    st.warning(f"No JSON files in `{JSON_DIR}`. Run app_text.py or app_vision.py first.")
     st.stop()
 
-try:
-    installed = pytesseract.get_languages(config="")
-except pytesseract.TesseractNotFoundError:
-    st.error(
-        "Tesseract binary not found. Install it and either add it to PATH or set "
-        "the TESSERACT_CMD environment variable to its full path."
-    )
+no_amount = int(df["amount"].isna().sum())
+no_date = int(df["date"].isna().sum())
+df = df.dropna(subset=["date", "amount"]).copy()
+
+if df.empty:
+    st.warning("No transactions have both a parseable date and amount yet.")
     st.stop()
 
-default_langs = [l for l in ("tha", "eng") if l in installed] or installed[:1]
-selected = st.multiselect(
-    "Tesseract language(s)",
-    options=sorted(installed),
-    default=default_langs,
-    help="Pick 'tha' for Thai. Combine with 'eng' for mixed Thai/English documents.",
+# --- Filters ---
+min_date, max_date = df["date"].min(), df["date"].max()
+with st.sidebar:
+    st.header("Filters")
+    date_range = st.date_input(
+        "Date range", value=(min_date, max_date), min_value=min_date, max_value=max_date
+    )
+
+    categories = sorted(df["category"].unique())
+    selected_categories = st.multiselect("Category", categories, default=categories)
+
+if isinstance(date_range, tuple) and len(date_range) == 2:
+    start_date, end_date = date_range
+else:
+    start_date = end_date = date_range
+
+mask = (
+    (df["date"] >= start_date)
+    & (df["date"] <= end_date)
+    & (df["category"].isin(selected_categories))
 )
-lang = "+".join(selected) if selected else "eng"
+filtered = df[mask].sort_values("datetime", ascending=False)
 
-if "tha" not in installed:
-    st.warning(
-        f"Thai language data ('tha') not found. Put `tha.traineddata` in `{TESSDATA_DIR}` "
-        "(alongside `eng.traineddata`). Download: "
-        "https://github.com/tesseract-ocr/tessdata/raw/main/tha.traineddata"
-    )
+skip_notes = []
+if no_date:
+    skip_notes.append(f"{no_date} slip(s) skipped — no parseable date")
+if no_amount:
+    skip_notes.append(f"{no_amount} slip(s) skipped — no parseable amount")
+if skip_notes:
+    st.caption("⚠️ " + "; ".join(skip_notes))
 
-if st.button("Run OCR on all images"):
-    for path in images:
-        st.subheader(path.name)
-        col_img, col_txt = st.columns(2)
-        with col_img:
-            st.image(str(path), use_container_width=True)
-        with col_txt:
-            with st.spinner(f"OCR: {path.name}"):
-                try:
-                    text = ocr_image(path, lang)
-                except pytesseract.TesseractNotFoundError:
-                    st.error(
-                        "Tesseract binary not found. Install it and either add it to "
-                        "PATH or set the TESSERACT_CMD environment variable to its full path."
-                    )
-                    st.stop()
-            if text:
-                st.code(text, height=300)
-                st.download_button(
-                    "Download .txt",
-                    data=text,
-                    file_name=f"{path.stem}.txt",
-                    key=f"dl_{path.name}",
-                )
-            else:
-                st.info("No text detected.")
+if filtered.empty:
+    st.info("No transactions match the current filters.")
+    st.stop()
+
+# --- KPIs ---
+c1, c2 = st.columns(2)
+c1.metric("Total spend", f"{filtered['amount'].sum():,.2f} บาท")
+c2.metric("Transactions", f"{len(filtered)}")
+
+st.divider()
+
+# --- Time drill-down ---
+st.subheader("Spend over time")
+tab_day, tab_hour, tab_weekday = st.tabs(["By day", "By hour", "By weekday"])
+with tab_day:
+    st.bar_chart(filtered.groupby("date")["amount"].sum().sort_index())
+with tab_hour:
+    hourly = filtered.groupby("hour")["amount"].sum().reindex(range(24), fill_value=0)
+    st.bar_chart(hourly)
+with tab_weekday:
+    weekday = filtered.groupby("weekday")["amount"].sum().reindex(WEEKDAY_ORDER, fill_value=0)
+    st.bar_chart(weekday)
+
+st.divider()
+
+# --- What it was spent on ---
+st.subheader("Spend by category")
+col_chart, col_table = st.columns([2, 1])
+by_cat = (
+    filtered.groupby("category")["amount"]
+    .agg(total="sum", count="count")
+    .sort_values("total", ascending=False)
+)
+with col_chart:
+    st.bar_chart(by_cat["total"])
+with col_table:
+    st.dataframe(by_cat.round(2), width="stretch")
+
+st.subheader("Top payees")
+by_payee = (
+    filtered.groupby("payee")["amount"]
+    .agg(total="sum", count="count")
+    .sort_values("total", ascending=False)
+    .head(15)
+)
+st.bar_chart(by_payee["total"])
+
+st.divider()
+
+# --- Detail table (sortable by clicking a column header — dig into amount/time) ---
+st.subheader(f"Transactions ({len(filtered)})")
+st.dataframe(
+    filtered[["datetime", "category", "payee", "payer", "amount", "fee", "slip_type", "transaction_ref"]],
+    width="stretch",
+    hide_index=True,
+)

@@ -19,6 +19,7 @@ Needs: `ollama serve` running + `ollama pull qwen2.5:3b`
 
 import json
 import re
+from datetime import datetime
 from pathlib import Path
 
 import requests
@@ -86,6 +87,50 @@ _DATETIME_RE = re.compile(
 _TITLE_RE = re.compile(r"^(?:น\.ส\.?|นาย|นาง|ด\.ช\.|ด\.ญ\.)\s*\S")
 _ACCT_RE = re.compile(r"[xX]{2,4}-[xX0-9]-[xX0-9]{2,}-[xX0-9]")
 _LATIN_SUFFIX_RE = re.compile(r"\(?[A-Za-z.\-/ ]+\)?")
+
+_THAI_MONTHS = {
+    "มกราคม": 1, "ม.ค.": 1, "ม.ค": 1,
+    "กุมภาพันธ์": 2, "ก.พ.": 2, "ก.พ": 2,
+    "มีนาคม": 3, "มี.ค.": 3, "มี.ค": 3,
+    "เมษายน": 4, "เม.ย.": 4, "เม.ย": 4,
+    "พฤษภาคม": 5, "พ.ค.": 5, "พ.ค": 5,
+    "มิถุนายน": 6, "มิ.ย.": 6, "มิ.ย": 6,
+    "กรกฎาคม": 7, "ก.ค.": 7, "ก.ค": 7,
+    "สิงหาคม": 8, "ส.ค.": 8, "ส.ค": 8,
+    "กันยายน": 9, "ก.ย.": 9, "ก.ย": 9,
+    "ตุลาคม": 10, "ต.ค.": 10, "ต.ค": 10,
+    "พฤศจิกายน": 11, "พ.ย.": 11, "พ.ย": 11,
+    "ธันวาคม": 12, "ธ.ค.": 12, "ธ.ค": 12,
+}
+_THAI_DATETIME_RE = re.compile(
+    r"(\d{1,2})\s+([ก-๙.]{2,10})\s+(\d{2,4})\s*[-–]?\s*(\d{1,2})[:.](\d{2})"
+)
+
+
+def normalize_thai_datetime(raw: str | None) -> str | None:
+    """
+    Parse a Buddhist-era Thai datetime like "8 ก.ย. 69 20:15 น." or
+    "07 ก.ย. 2569 - 18:21" into ISO "YYYY-MM-DD HH:MM" (Gregorian year).
+    Returns None (caller keeps the original string) if it doesn't match —
+    never guesses.
+    """
+    if not raw:
+        return None
+    m = _THAI_DATETIME_RE.search(raw)
+    if not m:
+        return None
+    day, month_th, year_be, hour, minute = m.groups()
+    month = _THAI_MONTHS.get(month_th)
+    if not month:
+        return None
+    year_be = int(year_be)
+    if year_be < 100:
+        year_be += 2500  # 2-digit BE year, e.g. "69" -> 2569
+    try:
+        dt = datetime(year_be - 543, month, int(day), int(hour), int(minute))
+    except ValueError:
+        return None
+    return dt.strftime("%Y-%m-%d %H:%M")
 
 CATEGORIES = (
     "food", "groceries", "shopping", "transport", "utilities", "health",
@@ -232,6 +277,9 @@ def extract_fields(text: str, model: str) -> dict:
             if not isinstance(result.get(side), dict):
                 result[side] = {"name": None, "bank": None, "account": None}
             result[side]["name"] = name
+
+    if result.get("datetime"):
+        result["datetime"] = normalize_thai_datetime(result["datetime"]) or result["datetime"]
 
     return result
 
