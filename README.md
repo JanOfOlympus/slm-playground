@@ -28,14 +28,33 @@
 - `streamlit run app_vision.py` — structured slip fields straight from images (`images/`)
 - `python resolve_categories.py` — step 2 (fill in `other` categories via a third-party AI)
 
-## app.py (dashboard)
+## app.py — two pages (`st.navigation`)
+
+### Dashboard
 - reads every `transactions_json/*.json` (skips any with no parseable date/amount)
-- sidebar filters: date range, category (multiselect), amount range
-- KPIs: total spend, transaction count, average, total fees (all filtered)
+- sidebar filters: date range, category (multiselect)
+- KPIs: total spend, transaction count (filtered)
 - drill-downs: spend by day / hour / weekday (tabs), spend by category
   (chart + table), top payees (chart), full sortable transaction table
-- purely local, no network calls; `.claude/launch.json` has a `dashboard` config
-  for previewing it in-editor
+- purely local, no network calls
+
+### Upload Slip
+- upload an image -> Tesseract OCR (`ocr_utils.py`, same engine as app_vision.py)
+  -> edit the text if the OCR is messy -> **Parse to JSON**
+  (`slip_parser.py`, same pipeline as app_text.py) -> **Save**, which writes
+  `images/<name>`, `transactions/<name>.txt`, `transactions_json/<name>.json`
+  so it shows up on the Dashboard immediately
+- needs: `ollama serve` + `ollama pull qwen2.5:3b`
+- Tesseract's Thai OCR on a raw photo is noticeably worse than Apple Live Text
+  (see app_text.py) — that's why the OCR text box is editable before parsing
+
+`.claude/launch.json` has a `dashboard` config for previewing app.py in-editor.
+
+## slip_parser.py / ocr_utils.py
+- shared, Streamlit-free logic modules: `slip_parser.py` is the OCR-text ->
+  JSON pipeline (used by app_text.py and app.py's Upload Slip page);
+  `ocr_utils.py` is the Tesseract setup + image -> text helper (used by
+  app.py's Upload Slip page)
 
 ## slip pipeline (two steps)
 
